@@ -19,6 +19,14 @@ DEFAULT_TOP_20 = [
     "PEPE", "UNI", "ICP", "RENDER", "FET"
 ]
 
+def format_price(val):
+    if val < 0.001:
+        return f"{val:.8f}"
+    elif val < 1:
+        return f"{val:.5f}"
+    else:
+        return f"{val:.4f}"
+
 def load_signals():
     if os.path.exists(LOG_FILE):
         try:
@@ -224,10 +232,14 @@ with tab1:
     if found:
         for s in found:
             color = "#00e676" if s['verdict'] == "LONG" else "#ff5252"
+            p_str = format_price(s['price'])
+            tp1_str = format_price(s['tp1'])
+            tp2_str = format_price(s['tp2'])
+            sl_str = format_price(s['sl'])
             st.markdown(f"""
             <div style="padding:15px; border-radius:10px; border-left:6px solid {color}; background-color:#1e1e24; margin-bottom:12px;">
-                <h3 style="margin:0; color:white;">{s['coin']} — <span style="color:{color};">{s['verdict']}</span> @ ${s['price']}</h3>
-                <p style="margin:5px 0; color:#b0b0b0;"><b>Target 1:</b> ${s['tp1']} | <b>Target 2:</b> ${s['tp2']} | <b>Stop Loss:</b> ${s['sl']}</p>
+                <h3 style="margin:0; color:white;">{s['coin']} — <span style="color:{color};">{s['verdict']}</span> @ ${p_str}</h3>
+                <p style="margin:5px 0; color:#b0b0b0;"><b>Target 1:</b> ${tp1_str} | <b>Target 2:</b> ${tp2_str} | <b>Stop Loss:</b> ${sl_str}</p>
                 <small style="color:#808080;">RSI (15m): {s['rsi']} | ADX (15m): {s['adx']}</small>
             </div>
             """, unsafe_allow_html=True)
@@ -254,6 +266,8 @@ with tab2:
         m4.metric("Active (Running)", len(df[df['status'] == "RUNNING"]))
 
         display_df = df[['id', 'time_str', 'coin', 'side', 'entry', 'tp1', 'tp2', 'sl', 'status', 'pnl_percent']].copy()
+        for col in ['entry', 'tp1', 'tp2', 'sl']:
+            display_df[col] = display_df[col].apply(format_price)
         display_df.columns = ['ID', 'Time', 'Coin', 'Type', 'Entry ($)', 'TP1 ($)', 'TP2 ($)', 'SL ($)', 'Status', 'PnL % (1x)']
         st.dataframe(display_df, use_container_width=True)
     else:
