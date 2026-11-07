@@ -1,7 +1,7 @@
 import streamlit as st
 import ccxt
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 import json
 import os
 import time
@@ -46,15 +46,32 @@ def fetch_and_analyze_tf(symbol, timeframe):
             
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        if len(df) >= 200:
-            df['EMA_TREND'] = ta.ema(df['close'], length=200)
-        else:
-            df['EMA_TREND'] = ta.ema(df['close'], length=50)
+        # EMA
+        ema_len = 200 if len(df) >= 200 else 50
+        df['EMA_TREND'] = df['close'].ewm(span=ema_len, adjust=False).mean()
 
-        df['RSI'] = ta.rsi(df['close'], length=14)
-        adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-        df['ADX'] = adx_df['ADX_14'] if adx_df is not None and 'ADX_14' in adx_df else 0.0
-        df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        # RSI (14)
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0.0).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/14, adjust=False).mean()
+        rs = gain / loss.replace(0, np.nan)
+        df['RSI'] = 100 - (100 / (1 + rs))
+
+        # ATR (14) & ADX (14)
+        high_low = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift()).abs()
+        low_close = (df['low'] - df['close'].shift()).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df['ATR'] = tr.ewm(alpha=1/14, adjust=False).mean()
+
+        up_move = df['high'].diff()
+        down_move = -df['low'].diff()
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean() / df['ATR'].replace(0, np.nan))
+        minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean() / df['ATR'].replace(0, np.nan))
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        df['ADX'] = dx.ewm(alpha=1/14, adjust=False).mean()
         
         df = df.dropna(subset=['close'])
         if df.empty:
