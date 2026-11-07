@@ -121,9 +121,10 @@ def scan_single_coin(coin):
             if 42 <= tf_15m['rsi'] <= 64 and funding_rate > -0.04:
                 verdict = "SHORT"
 
-    sl = round(price - (1.5 * atr), 4) if verdict == "LONG" else round(price + (1.5 * atr), 4)
-    tp1 = round(price + (1.5 * atr), 4) if verdict == "LONG" else round(price - (1.5 * atr), 4)
-    tp2 = round(price + (3.0 * atr), 4) if verdict == "LONG" else round(price - (3.0 * atr), 4)
+    decimals = 8 if price < 0.001 else (5 if price < 1 else 4)
+    sl = round(price - (1.5 * atr), decimals) if verdict == "LONG" else round(price + (1.5 * atr), decimals)
+    tp1 = round(price + (1.5 * atr), decimals) if verdict == "LONG" else round(price - (1.5 * atr), decimals)
+    tp2 = round(price + (3.0 * atr), decimals) if verdict == "LONG" else round(price - (3.0 * atr), decimals)
 
     return {
         "coin": coin, "symbol": symbol, "price": price,
