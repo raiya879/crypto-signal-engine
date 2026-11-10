@@ -2,15 +2,17 @@ import streamlit as st
 import ccxt
 import pandas as pd
 import numpy as np
+import requests
 import json
 import os
 import time
 from datetime import datetime
 
-st.set_page_config(page_title="Crypto Quant Signal Engine V2", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Crypto Quant Signal Engine V3", page_icon="⚡", layout="wide")
 
 exchange = ccxt.kucoinfutures({'enableRateLimit': True, 'timeout': 10000})
 LOG_FILE = "top20_signals_history.json"
+CONFIG_FILE = "bot_config.json"
 
 DEFAULT_TOP_20 = [
     "BTC", "ETH", "SOL", "XRP", "DOGE", 
@@ -29,6 +31,47 @@ def format_price(val):
         return f"{val:.5f}"
     else:
         return f"{val:.4f}"
+
+def load_config():
+    cfg = {"tg_token": "", "tg_chat_id": ""}
+    try:
+        if "TG_TOKEN" in st.secrets:
+            cfg["tg_token"] = st.secrets["TG_TOKEN"]
+        if "TG_CHAT_ID" in st.secrets:
+            cfg["tg_chat_id"] = st.secrets["TG_CHAT_ID"]
+    except Exception:
+        pass
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                saved = json.load(f)
+                if not cfg["tg_token"]:
+                    cfg["tg_token"] = saved.get("tg_token", "")
+                if not cfg["tg_chat_id"]:
+                    cfg["tg_chat_id"] = saved.get("tg_chat_id", "")
+        except Exception:
+            pass
+    return cfg
+
+def save_config(tg_token, tg_chat_id):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump({"tg_token": tg_token, "tg_chat_id": tg_chat_id}, f)
+
+def send_telegram_msg(token, chat_id, message):
+    if not token or not chat_id:
+        return False
+    url = f"https://api.telegram.org/bot{token.strip()}/sendMessage"
+    payload = {
+        "chat_id": chat_id.strip(),
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=8)
+        return r.status_code == 200
+    except Exception:
+        return False
 
 def load_signals():
     if os.path.exists(LOG_FILE):
@@ -49,6 +92,11 @@ def update_signals_db(signals_list):
     with open(LOG_FILE, "w") as f:
         json.dump(signals_list, f, indent=4)
 
+def clear_all_signals():
+    with open(LOG_FILE, "w") as f:
+        json.dump([], f, indent=4)
+    st.session_state['last_scan'] = []
+
 def is_in_cooldown(coin, existing_signals, cooldown_hours=4):
     now_ms = exchange.milliseconds()
     cooldown_ms = cooldown_hours * 3600 * 1000
@@ -67,20 +115,17 @@ def fetch_and_analyze_tf(symbol, timeframe):
             
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        # EMAs (20, 50, 200)
         df['EMA20'] = df['close'].ewm(span=20, adjust=False).mean()
         df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
         ema_len = 200 if len(df) >= 200 else 100
         df['EMA200'] = df['close'].ewm(span=ema_len, adjust=False).mean()
 
-        # RSI (14)
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0.0).ewm(alpha=1/14, adjust=False).mean()
         loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/14, adjust=False).mean()
         rs = gain / loss.replace(0, np.nan)
         df['RSI'] = 100 - (100 / (1 + rs))
 
-        # ATR (14) & ADX (14)
         high_low = df['high'] - df['low']
         high_close = (df['high'] - df['close'].shift()).abs()
         low_close = (df['low'] - df['close'].shift()).abs()
@@ -96,7 +141,6 @@ def fetch_and_analyze_tf(symbol, timeframe):
         dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
         df['ADX'] = dx.ewm(alpha=1/14, adjust=False).mean()
 
-        # Volume Moving Average (20)
         df['VOL_MA20'] = df['volume'].rolling(20).mean()
         
         df = df.dropna(subset=['close'])
@@ -126,7 +170,6 @@ def fetch_and_analyze_tf(symbol, timeframe):
         vol_ma = float(latest['VOL_MA20']) if pd.notna(latest['VOL_MA20']) and latest['VOL_MA20'] > 0 else 1.0
         rvol = float(latest['volume']) / vol_ma
 
-        # Check last closed candle or current forming candle direction
         bull_candle = (close_val > open_val) or (float(prev['close']) > float(prev['open']))
         bear_candle = (close_val < open_val) or (float(prev['close']) < float(prev['open']))
 
@@ -134,19 +177,10 @@ def fetch_and_analyze_tf(symbol, timeframe):
         swing_high = float(df['high'].tail(12).max())
         
         return {
-            "close": close_val,
-            "ema20": ema20_val,
-            "ema50": ema50_val,
-            "ema200": ema200_val,
-            "rsi": rsi_val,
-            "adx": adx_val,
-            "atr": atr_val,
-            "rvol": rvol,
-            "trend": trend,
-            "bull_candle": bull_candle,
-            "bear_candle": bear_candle,
-            "swing_low": swing_low,
-            "swing_high": swing_high
+            "close": close_val, "ema20": ema20_val, "ema50": ema50_val, "ema200": ema200_val,
+            "rsi": rsi_val, "adx": adx_val, "atr": atr_val, "rvol": rvol,
+            "trend": trend, "bull_candle": bull_candle, "bear_candle": bear_candle,
+            "swing_low": swing_low, "swing_high": swing_high
         }
     except Exception:
         return None
@@ -181,26 +215,22 @@ def scan_single_coin(coin, btc_regime):
     atr_15m = tf_15m['atr']
     verdict = "WAIT"
 
-    # Overextension Check: Do not chase if price is too far (> 2.2x ATR) from 15m EMA20
     dist_from_ema20 = abs(price - tf_15m['ema20'])
     not_overextended = dist_from_ema20 <= (2.2 * atr_15m)
 
     if tf_15m['adx'] >= 20 and tf_1h['adx'] >= 20 and not_overextended:
-        # LONG CONFLUENCE
         if (tf_4h['trend'] == "BULLISH" and tf_1h['trend'] == "BULLISH" and 
             price >= tf_15m['ema20'] * 0.998 and tf_15m['ema20'] >= tf_15m['ema50'] * 0.998 and
             tf_15m['bull_candle'] and btc_regime != "STRONG_BEAR"):
             if 40 <= tf_15m['rsi'] <= 62 and funding_rate < 0.04:
                 verdict = "LONG"
                 
-        # SHORT CONFLUENCE
         elif (tf_4h['trend'] == "BEARISH" and tf_1h['trend'] == "BEARISH" and 
               price <= tf_15m['ema20'] * 1.002 and tf_15m['ema20'] <= tf_15m['ema50'] * 1.002 and
               tf_15m['bear_candle'] and btc_regime != "STRONG_BULL"):
             if 38 <= tf_15m['rsi'] <= 60 and funding_rate > -0.04:
                 verdict = "SHORT"
 
-    # Confidence Score Calculation (0 - 100%)
     score = 60
     if tf_15m['adx'] >= 25 and tf_1h['adx'] >= 25:
         score += 10
@@ -215,7 +245,6 @@ def scan_single_coin(coin, btc_regime):
         score += 8
     score = min(99, score)
 
-    # Structure + ATR Smart Stop Loss & Targets
     decimals = 8 if price < 0.001 else (5 if price < 1 else 4)
     if verdict == "LONG":
         struct_sl = tf_15m['swing_low'] - (0.25 * atr_15m)
@@ -247,12 +276,13 @@ def scan_single_coin(coin, btc_regime):
         "rvol": round(tf_15m['rvol'], 2), "score": score, "sl_pct": sl_pct
     }
 
-def update_history():
+def update_history(tg_token="", tg_chat_id=""):
     signals = load_signals()
     if not signals: 
         return
     for sig in signals:
-        if sig['status'] in ["FULL WIN (TP2)", "PARTIAL WIN (TP1->BE)", "LOSS (SL Hit)"]:
+        old_status = sig.get('status', 'RUNNING')
+        if old_status in ["FULL WIN (TP2)", "PARTIAL WIN (TP1->BE)", "LOSS (SL Hit)"]:
             continue
         try:
             candles = exchange.fetch_ohlcv(sig['symbol'], timeframe='5m', since=sig['timestamp_ms'], limit=500)
@@ -293,69 +323,135 @@ def update_history():
             sig['status'] = status
             sig['tp1_hit'] = tp1_hit
             sig['pnl_percent'] = round(pnl, 2)
+
+            if status != "RUNNING" and old_status == "RUNNING" and tg_token and tg_chat_id:
+                emoji = "✅" if "WIN" in status else "❌"
+                msg = (
+                    f"{emoji} <b>Trade Closed: {sig['coin']} ({side})</b>\n"
+                    f"<b>Outcome:</b> {status}\n"
+                    f"<b>PnL (1x):</b> {sig['pnl_percent']}%"
+                )
+                send_telegram_msg(tg_token, tg_chat_id, msg)
         except Exception:
             pass
     update_signals_db(signals)
 
-# Sidebar: Risk & Filter Settings
+def execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, tg_chat_id):
+    status_box = st.empty()
+    status_box.info("🔍 Updating trade outcomes & scanning Top 20 coins...")
+    
+    update_history(tg_token, tg_chat_id)
+    btc_regime, btc_rsi = get_btc_regime()
+    st.session_state['btc_regime'] = (btc_regime, btc_rsi)
+    
+    existing = load_signals()
+    active_coins = [s['coin'] for s in existing if s.get('status') == "RUNNING"]
+    candidates = []
+    
+    for i, coin in enumerate(DEFAULT_TOP_20):
+        status_box.text(f"BTC Regime: {btc_regime} | Scanning [{i+1}/20]: {coin}...")
+        if is_in_cooldown(coin, existing):
+            continue
+        res = scan_single_coin(coin, btc_regime)
+        if res and res['verdict'] in ["LONG", "SHORT"] and res['score'] >= min_score:
+            candidates.append(res)
+        time.sleep(0.1)
+        
+    candidates.sort(key=lambda x: (x['score'], x['adx']), reverse=True)
+    found = candidates[:max_signals]
+    
+    risk_amount = acc_balance * (risk_pct / 100.0)
+    next_id = max([s.get('id', 0) for s in existing], default=0) + 1
+    
+    for res in found:
+        coin = res['coin']
+        if coin not in active_coins:
+            rec = {
+                "id": next_id, "coin": coin, "symbol": res['symbol'],
+                "side": res['verdict'], "entry": res['price'], "sl": res['sl'],
+                "tp1": res['tp1'], "tp2": res['tp2'],
+                "score": res['score'],
+                "timestamp_ms": exchange.milliseconds(),
+                "time_str": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "status": "RUNNING", "tp1_hit": False, "pnl_percent": 0.0
+            }
+            save_signal(rec)
+            existing.append(rec)
+            active_coins.append(coin)
+            next_id += 1
+
+            if tg_token and tg_chat_id:
+                sl_pct = max(res.get('sl_pct', 1.5), 0.2)
+                pos_size = round(risk_amount / (sl_pct / 100.0), 1)
+                rec_lev = max(1, min(20, int(100 / (sl_pct * 2.5))))
+                icon = "🟢 LONG" if res['verdict'] == "LONG" else "🔴 SHORT"
+                msg = (
+                    f"⚡ <b>NEW PRO SIGNAL: {coin}/USDT</b>\n"
+                    f"<b>Direction:</b> {icon} (🔥 Score: {res['score']}%)\n"
+                    f"<b>Entry:</b> ${format_price(res['price'])}\n"
+                    f"🎯 <b>TP 1 (1.5R):</b> ${format_price(res['tp1'])}\n"
+                    f"🚀 <b>TP 2 (3.0R):</b> ${format_price(res['tp2'])}\n"
+                    f"🛑 <b>Smart SL:</b> ${format_price(res['sl'])} (-{sl_pct}%)\n\n"
+                    f"💰 <b>Suggested Size:</b> ${pos_size} USDT (Max {rec_lev}x)\n"
+                    f"📊 <b>15m RSI:</b> {res['rsi']} | <b>ADX:</b> {res['adx']} | <b>RVOL:</b> {res['rvol']}x"
+                )
+                send_telegram_msg(tg_token, tg_chat_id, msg)
+        
+    status_box.empty()
+    st.session_state['last_scan'] = found
+    st.session_state['scan_completed'] = True
+    st.session_state['last_scan_time'] = datetime.now().strftime("%H:%M:%S")
+
+# Load saved Telegram config
+cfg = load_config()
+
+# Sidebar Controls
 with st.sidebar:
+    st.header("⏰ Auto-Scanner")
+    auto_scan = st.toggle("Enable Auto-Scan (24/7 Live)", value=False)
+    scan_interval = st.selectbox("Scan Interval (Minutes)", [5, 15, 30, 60], index=1)
+    if 'last_scan_time' in st.session_state:
+        st.caption(f"Last scanned at: **{st.session_state['last_scan_time']}**")
+
+    st.divider()
+    st.header("📲 Telegram Alert Bot")
+    tg_token = st.text_input("Bot Token", value=cfg["tg_token"], type="password", placeholder="123456:ABC-DEF...")
+    tg_chat_id = st.text_input("Chat ID", value=cfg["tg_chat_id"], placeholder="e.g. 987654321")
+    
+    c1, c2 = st.columns(2)
+    if c1.button("💾 Save Bot", use_container_width=True):
+        save_config(tg_token, tg_chat_id)
+        st.success("Saved!")
+    if c2.button("🔔 Test Alert", use_container_width=True):
+        if send_telegram_msg(tg_token, tg_chat_id, "✅ <b>Crypto Quant V3 Bot Connected!</b>\nYou will now receive instant 24/7 trade alerts."):
+            st.success("Sent!")
+        else:
+            st.error("Failed! Check Token/ID.")
+
+    st.divider()
     st.header("⚙️ Risk & Filter Settings")
     acc_balance = st.number_input("Account Balance ($)", min_value=10.0, value=100.0, step=10.0)
     risk_pct = st.slider("Risk per Trade (%)", min_value=0.5, max_value=5.0, value=1.5, step=0.5)
     max_signals = st.slider("Max Top Signals per Scan", min_value=1, max_value=5, value=3)
     min_score = st.slider("Minimum Confidence Score (%)", min_value=60, max_value=90, value=70, step=5)
-    st.caption("🛡️ **Active Pro Guards:**\n- BTC Market Regime Filter\n- EMA 20/50/200 Alignment\n- Candle Close & RVOL Check\n- 4H Loss Cooldown Lock")
+
+    st.divider()
+    st.header("🗑️ History Management")
+    confirm_clear = st.checkbox("Confirm Delete All History")
+    if st.button("🚨 Clear All Trade History", use_container_width=True, disabled=not confirm_clear):
+        clear_all_signals()
+        st.success("All history cleared!")
+        st.rerun()
 
 # Main UI Layout
-st.title("⚡ Crypto Futures Confluence Scanner V2")
-st.caption("Institutional Multi-Timeframe Engine • BTC Regime Guard • Smart Structure Stops")
+st.title("⚡ Crypto Futures Confluence Scanner V3")
+st.caption("Auto-Scan Engine • Instant Telegram Bot • Smart Structure Stops")
 
 tab1, tab2 = st.tabs(["🚀 Active Market Signals", "📊 Historical Track Record"])
 
 with tab1:
-    if st.button("🔄 Scan Top 20 Now (Pro V2 Engine)", use_container_width=True):
-        status_box = st.empty()
-        status_box.info("🔍 Checking BTC Market Regime & Connecting to KuCoin Futures...")
-        
-        btc_regime, btc_rsi = get_btc_regime()
-        st.session_state['btc_regime'] = (btc_regime, btc_rsi)
-        
-        existing = load_signals()
-        active_coins = [s['coin'] for s in existing if s.get('status') == "RUNNING"]
-        candidates = []
-        
-        for i, coin in enumerate(DEFAULT_TOP_20):
-            status_box.text(f"BTC Regime: {btc_regime} | Scanning [{i+1}/20]: {coin}...")
-            if is_in_cooldown(coin, existing):
-                continue
-            res = scan_single_coin(coin, btc_regime)
-            if res and res['verdict'] in ["LONG", "SHORT"] and res['score'] >= min_score:
-                candidates.append(res)
-            time.sleep(0.1)
-            
-        # Sort by highest confidence score & ADX, then pick Top N
-        candidates.sort(key=lambda x: (x['score'], x['adx']), reverse=True)
-        found = candidates[:max_signals]
-        
-        for res in found:
-            coin = res['coin']
-            if coin not in active_coins:
-                rec = {
-                    "id": len(existing) + 1, "coin": coin, "symbol": res['symbol'],
-                    "side": res['verdict'], "entry": res['price'], "sl": res['sl'],
-                    "tp1": res['tp1'], "tp2": res['tp2'],
-                    "score": res['score'],
-                    "timestamp_ms": exchange.milliseconds(),
-                    "time_str": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "status": "RUNNING", "tp1_hit": False, "pnl_percent": 0.0
-                }
-                save_signal(rec)
-                existing.append(rec)
-                active_coins.append(coin)
-            
-        status_box.empty()
-        st.session_state['last_scan'] = found
-        st.session_state['scan_completed'] = True
+    if st.button("🔄 Scan Top 20 Now", use_container_width=True):
+        execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, tg_chat_id)
 
     if 'btc_regime' in st.session_state:
         b_reg, b_rsi = st.session_state['btc_regime']
@@ -394,15 +490,26 @@ with tab1:
             </div>
             """, unsafe_allow_html=True)
     elif st.session_state.get('scan_completed'):
-        st.info("⏸️ No high-probability setups passed all V2 Institutional Filters right now. Capital preservation mode active!")
+        st.info("⏸️ No high-probability setups passed all Institutional Filters right now. Capital preservation mode active!")
 
 with tab2:
-    if st.button("🔄 Refresh Outcomes & Win Rate"):
-        with st.spinner("Replaying candles..."):
-            update_history()
+    col_a, col_b = st.columns([3, 2])
+    with col_a:
+        if st.button("🔄 Refresh Outcomes & Win Rate", use_container_width=True):
+            with st.spinner("Replaying candles..."):
+                update_history(tg_token, tg_chat_id)
 
     signals = load_signals()
     if signals:
+        with col_b:
+            all_ids = [s['id'] for s in signals]
+            del_ids = st.multiselect("Select Trade IDs to Delete", options=all_ids, label_visibility="collapsed", placeholder="Select Trade ID(s) to delete...")
+            if del_ids and st.button("🗑️ Delete Selected Trade(s)", use_container_width=True):
+                filtered = [s for s in signals if s['id'] not in del_ids]
+                update_signals_db(filtered)
+                st.success(f"Deleted Trade ID(s): {del_ids}")
+                st.rerun()
+
         df = pd.DataFrame(signals)
         if 'score' not in df.columns:
             df['score'] = 75
@@ -424,3 +531,18 @@ with tab2:
         st.dataframe(display_df, use_container_width=True)
     else:
         st.write("No recorded signals yet.")
+
+# Background Auto-Scan Loop
+if auto_scan:
+    if not st.session_state.get('scan_completed'):
+        execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, tg_chat_id)
+        st.rerun()
+    placeholder = st.sidebar.empty()
+    total_secs = scan_interval * 60
+    for remaining in range(total_secs, 0, -1):
+        mins, secs = divmod(remaining, 60)
+        placeholder.info(f"⏳ Next Auto-Scan in: **{mins:02d}:{secs:02d}**")
+        time.sleep(1)
+    placeholder.empty()
+    execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, tg_chat_id)
+    st.rerun()
