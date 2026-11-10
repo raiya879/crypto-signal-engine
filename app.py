@@ -8,7 +8,7 @@ import os
 import time
 from datetime import datetime
 
-st.set_page_config(page_title="Crypto Quant Signal Engine V3", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Crypto Quant Signal Engine V4", page_icon="⚡", layout="wide")
 
 exchange = ccxt.kucoinfutures({'enableRateLimit': True, 'timeout': 10000})
 LOG_FILE = "top20_signals_history.json"
@@ -19,6 +19,18 @@ DEFAULT_TOP_20 = [
     "ADA", "BNB", "SUI", "AVAX", "LINK", 
     "NEAR", "APT", "DOT", "LTC", "SHIB", 
     "PEPE", "UNI", "ICP", "RENDER", "FET"
+]
+
+BULLISH_WORDS = [
+    'surge', 'soar', 'bull', 'rally', 'breakout', 'adoption', 'etf', 'inflow',
+    'partnership', 'upgrade', 'launch', 'buy', 'accumulate', 'record', 'high',
+    'gain', 'pump', 'approve', 'approved', 'support', 'whale', 'institutional'
+]
+
+BEARISH_WORDS = [
+    'hack', 'exploit', 'crash', 'dump', 'bear', 'plunge', 'ban', 'lawsuit',
+    'sec', 'outflow', 'selloff', 'sell-off', 'drop', 'fall', 'liquidation',
+    'delist', 'investigation', 'fraud', 'scam', 'warn', 'warning', 'reject', 'fine'
 ]
 
 def format_price(val):
@@ -72,6 +84,68 @@ def send_telegram_msg(token, chat_id, message):
         return r.status_code == 200
     except Exception:
         return False
+
+def fetch_market_news_and_fng():
+    """Fetches live Crypto News & Fear/Greed Index without requiring API keys."""
+    fng_val, fng_class = 50, "Neutral"
+    try:
+        r_fng = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5).json()
+        if 'data' in r_fng and len(r_fng['data']) > 0:
+            fng_val = int(r_fng['data'][0]['value'])
+            fng_class = r_fng['data'][0]['value_classification']
+    except Exception:
+        pass
+
+    articles = []
+    try:
+        r_news = requests.get("https://min-api.cryptocompare.com/data/v2/news/?lang=EN", timeout=6).json()
+        articles = r_news.get("Data", [])[:50]
+    except Exception:
+        pass
+
+    coin_sentiment = {}
+    global_score = 0
+
+    for art in articles:
+        title = art.get("title", "")
+        body = art.get("body", "")[:250]
+        categories = art.get("categories", "").upper().split("|")
+        text = f"{title} {body}".lower()
+
+        score = 0
+        for w in BULLISH_WORDS:
+            if w in text:
+                score += 1
+        for w in BEARISH_WORDS:
+            if w in text:
+                score -= 1.2
+
+        global_score += score
+
+        for coin in DEFAULT_TOP_20:
+            if coin in categories or f" {coin.lower()} " in f" {text} ":
+                if coin not in coin_sentiment:
+                    coin_sentiment[coin] = {"score": 0.0, "headline": title, "count": 0}
+                coin_sentiment[coin]["score"] += score
+                coin_sentiment[coin]["count"] += 1
+
+    global_bias = "BULLISH" if global_score > 3 else ("BEARISH" if global_score < -3 else "NEUTRAL")
+    return {
+        "fng_val": fng_val,
+        "fng_class": fng_class,
+        "global_bias": global_bias,
+        "global_score": round(global_score, 1),
+        "coins": coin_sentiment,
+        "top_headlines": [a.get("title", "") for a in articles[:5]]
+    }
+
+def get_coin_news_status(coin, news_data):
+    c_info = news_data.get("coins", {}).get(coin, None)
+    if c_info and c_info["count"] > 0:
+        sc = c_info["score"]
+        label = "BULLISH" if sc >= 1.0 else ("BEARISH" if sc <= -1.0 else "NEUTRAL")
+        return label, round(sc, 1), c_info["headline"]
+    return news_data.get("global_bias", "NEUTRAL"), 0.0, "No coin-specific breaking news (Following Global Sentiment)"
 
 def load_signals():
     if os.path.exists(LOG_FILE):
@@ -156,9 +230,9 @@ def fetch_and_analyze_tf(symbol, timeframe):
         ema50_val = float(latest['EMA50'])
         ema200_val = float(latest['EMA200']) if pd.notna(latest['EMA200']) else close_val
         
-        if close_val > ema50_val and ema50_val >= ema200_val * 0.998:
+        if close_val > ema50_val and ema50_val >= ema200_val * 0.999:
             trend = "BULLISH"
-        elif close_val < ema50_val and ema50_val <= ema200_val * 1.002:
+        elif close_val < ema50_val and ema50_val <= ema200_val * 1.001:
             trend = "BEARISH"
         else:
             trend = "NEUTRAL"
@@ -170,11 +244,12 @@ def fetch_and_analyze_tf(symbol, timeframe):
         vol_ma = float(latest['VOL_MA20']) if pd.notna(latest['VOL_MA20']) and latest['VOL_MA20'] > 0 else 1.0
         rvol = float(latest['volume']) / vol_ma
 
-        bull_candle = (close_val > open_val) or (float(prev['close']) > float(prev['open']))
-        bear_candle = (close_val < open_val) or (float(prev['close']) < float(prev['open']))
+        # Strict closed candle confirmation
+        bull_candle = (close_val > open_val) and (float(prev['close']) >= float(prev['open']))
+        bear_candle = (close_val < open_val) and (float(prev['close']) <= float(prev['open']))
 
-        swing_low = float(df['low'].tail(12).min())
-        swing_high = float(df['high'].tail(12).max())
+        swing_low = float(df['low'].tail(14).min())
+        swing_high = float(df['high'].tail(14).max())
         
         return {
             "close": close_val, "ema20": ema20_val, "ema50": ema50_val, "ema200": ema200_val,
@@ -190,13 +265,13 @@ def get_btc_regime():
     tf_15m = fetch_and_analyze_tf("BTC/USDT:USDT", '15m')
     if not tf_1h or not tf_15m:
         return "NEUTRAL", 50.0
-    if tf_15m['close'] > tf_15m['ema20'] and tf_15m['rsi'] > 55 and tf_1h['close'] > tf_1h['ema50']:
+    if tf_15m['close'] > tf_15m['ema20'] and tf_15m['rsi'] > 53 and tf_1h['close'] > tf_1h['ema50']:
         return "STRONG_BULL", round(tf_15m['rsi'], 1)
-    elif tf_15m['close'] < tf_15m['ema20'] and tf_15m['rsi'] < 45 and tf_1h['close'] < tf_1h['ema50']:
+    elif tf_15m['close'] < tf_15m['ema20'] and tf_15m['rsi'] < 47 and tf_1h['close'] < tf_1h['ema50']:
         return "STRONG_BEAR", round(tf_15m['rsi'], 1)
     return "NEUTRAL", round(tf_15m['rsi'], 1)
 
-def scan_single_coin(coin, btc_regime):
+def scan_single_coin(coin, btc_regime, news_data, use_news_guard=True):
     symbol = f"{coin}/USDT:USDT"
     tf_4h = fetch_and_analyze_tf(symbol, '4h')
     tf_1h = fetch_and_analyze_tf(symbol, '1h')
@@ -215,34 +290,47 @@ def scan_single_coin(coin, btc_regime):
     atr_15m = tf_15m['atr']
     verdict = "WAIT"
 
+    news_label, news_score, headline = get_coin_news_status(coin, news_data)
+
+    # Strict Overextension & Volume Filter
     dist_from_ema20 = abs(price - tf_15m['ema20'])
-    not_overextended = dist_from_ema20 <= (2.2 * atr_15m)
+    not_overextended = dist_from_ema20 <= (1.8 * atr_15m)
+    has_volume = tf_15m['rvol'] >= 0.85
 
-    if tf_15m['adx'] >= 20 and tf_1h['adx'] >= 20 and not_overextended:
+    if tf_15m['adx'] >= 22 and tf_1h['adx'] >= 22 and not_overextended and has_volume:
+        # ULTRA-STRICT LONG CONFLUENCE
         if (tf_4h['trend'] == "BULLISH" and tf_1h['trend'] == "BULLISH" and 
-            price >= tf_15m['ema20'] * 0.998 and tf_15m['ema20'] >= tf_15m['ema50'] * 0.998 and
+            price > tf_15m['ema20'] and tf_15m['ema20'] > tf_15m['ema50'] and
             tf_15m['bull_candle'] and btc_regime != "STRONG_BEAR"):
-            if 40 <= tf_15m['rsi'] <= 62 and funding_rate < 0.04:
-                verdict = "LONG"
+            if 44 <= tf_15m['rsi'] <= 60 and funding_rate < 0.035:
+                if not (use_news_guard and news_label == "BEARISH"):
+                    verdict = "LONG"
                 
+        # ULTRA-STRICT SHORT CONFLUENCE
         elif (tf_4h['trend'] == "BEARISH" and tf_1h['trend'] == "BEARISH" and 
-              price <= tf_15m['ema20'] * 1.002 and tf_15m['ema20'] <= tf_15m['ema50'] * 1.002 and
+              price < tf_15m['ema20'] and tf_15m['ema20'] < tf_15m['ema50'] and
               tf_15m['bear_candle'] and btc_regime != "STRONG_BULL"):
-            if 38 <= tf_15m['rsi'] <= 60 and funding_rate > -0.04:
-                verdict = "SHORT"
+            if 40 <= tf_15m['rsi'] <= 56 and funding_rate > -0.035:
+                if not (use_news_guard and news_label == "BULLISH"):
+                    verdict = "SHORT"
 
-    score = 60
-    if tf_15m['adx'] >= 25 and tf_1h['adx'] >= 25:
+    # Multi-Factor Institutional Confidence Score (Technical + News + BTC)
+    score = 62
+    if tf_15m['adx'] >= 26 and tf_1h['adx'] >= 26:
         score += 10
-    if tf_15m['rvol'] >= 1.15:
-        score += 12
-    elif tf_15m['rvol'] >= 0.85:
+    if tf_15m['rvol'] >= 1.25:
+        score += 10
+    elif tf_15m['rvol'] >= 1.0:
         score += 5
     if (verdict == "LONG" and btc_regime == "STRONG_BULL") or (verdict == "SHORT" and btc_regime == "STRONG_BEAR"):
-        score += 10
+        score += 8
     if (verdict == "LONG" and tf_15m['ema20'] > tf_15m['ema50'] > tf_15m['ema200']) or \
        (verdict == "SHORT" and tf_15m['ema20'] < tf_15m['ema50'] < tf_15m['ema200']):
+        score += 6
+    if (verdict == "LONG" and news_label == "BULLISH") or (verdict == "SHORT" and news_label == "BEARISH"):
         score += 8
+    elif news_label == "NEUTRAL":
+        score += 3
     score = min(99, score)
 
     decimals = 8 if price < 0.001 else (5 if price < 1 else 4)
@@ -273,7 +361,8 @@ def scan_single_coin(coin, btc_regime):
         "coin": coin, "symbol": symbol, "price": price,
         "verdict": verdict, "sl": sl, "tp1": tp1, "tp2": tp2,
         "rsi": round(tf_15m['rsi'], 1), "adx": round(tf_15m['adx'], 1),
-        "rvol": round(tf_15m['rvol'], 2), "score": score, "sl_pct": sl_pct
+        "rvol": round(tf_15m['rvol'], 2), "score": score, "sl_pct": sl_pct,
+        "news_label": news_label, "headline": headline
     }
 
 def update_history(tg_token="", tg_chat_id=""):
@@ -336,11 +425,14 @@ def update_history(tg_token="", tg_chat_id=""):
             pass
     update_signals_db(signals)
 
-def execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, tg_chat_id):
+def execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, tg_chat_id, use_news_guard):
     status_box = st.empty()
-    status_box.info("🔍 Updating trade outcomes & scanning Top 20 coins...")
+    status_box.info("📰 Fetching Live Crypto News, Fear & Greed Index & BTC Regime...")
     
     update_history(tg_token, tg_chat_id)
+    news_data = fetch_market_news_and_fng()
+    st.session_state['news_data'] = news_data
+    
     btc_regime, btc_rsi = get_btc_regime()
     st.session_state['btc_regime'] = (btc_regime, btc_rsi)
     
@@ -349,10 +441,10 @@ def execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, t
     candidates = []
     
     for i, coin in enumerate(DEFAULT_TOP_20):
-        status_box.text(f"BTC Regime: {btc_regime} | Scanning [{i+1}/20]: {coin}...")
+        status_box.text(f"BTC: {btc_regime} | News: {news_data['global_bias']} | Scanning [{i+1}/20]: {coin}...")
         if is_in_cooldown(coin, existing):
             continue
-        res = scan_single_coin(coin, btc_regime)
+        res = scan_single_coin(coin, btc_regime, news_data, use_news_guard)
         if res and res['verdict'] in ["LONG", "SHORT"] and res['score'] >= min_score:
             candidates.append(res)
         time.sleep(0.1)
@@ -371,6 +463,7 @@ def execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, t
                 "side": res['verdict'], "entry": res['price'], "sl": res['sl'],
                 "tp1": res['tp1'], "tp2": res['tp2'],
                 "score": res['score'],
+                "news": res['news_label'],
                 "timestamp_ms": exchange.milliseconds(),
                 "time_str": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "status": "RUNNING", "tp1_hit": False, "pnl_percent": 0.0
@@ -386,14 +479,16 @@ def execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, t
                 rec_lev = max(1, min(20, int(100 / (sl_pct * 2.5))))
                 icon = "🟢 LONG" if res['verdict'] == "LONG" else "🔴 SHORT"
                 msg = (
-                    f"⚡ <b>NEW PRO SIGNAL: {coin}/USDT</b>\n"
+                    f"⚡ <b>SNIPER V4 SIGNAL: {coin}/USDT</b>\n"
                     f"<b>Direction:</b> {icon} (🔥 Score: {res['score']}%)\n"
                     f"<b>Entry:</b> ${format_price(res['price'])}\n"
                     f"🎯 <b>TP 1 (1.5R):</b> ${format_price(res['tp1'])}\n"
                     f"🚀 <b>TP 2 (3.0R):</b> ${format_price(res['tp2'])}\n"
                     f"🛑 <b>Smart SL:</b> ${format_price(res['sl'])} (-{sl_pct}%)\n\n"
-                    f"💰 <b>Suggested Size:</b> ${pos_size} USDT (Max {rec_lev}x)\n"
-                    f"📊 <b>15m RSI:</b> {res['rsi']} | <b>ADX:</b> {res['adx']} | <b>RVOL:</b> {res['rvol']}x"
+                    f"📰 <b>News Sentiment:</b> {res['news_label']}\n"
+                    f"<i>\"{res['headline'][:90]}...\"</i>\n\n"
+                    f"💰 <b>Size:</b> ${pos_size} USDT (Max {rec_lev}x)\n"
+                    f"📊 <b>RSI:</b> {res['rsi']} | <b>ADX:</b> {res['adx']} | <b>RVOL:</b> {res['rvol']}x"
                 )
                 send_telegram_msg(tg_token, tg_chat_id, msg)
         
@@ -402,7 +497,6 @@ def execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, t
     st.session_state['scan_completed'] = True
     st.session_state['last_scan_time'] = datetime.now().strftime("%H:%M:%S")
 
-# Load saved Telegram config
 cfg = load_config()
 
 # Sidebar Controls
@@ -414,26 +508,30 @@ with st.sidebar:
         st.caption(f"Last scanned at: **{st.session_state['last_scan_time']}**")
 
     st.divider()
+    st.header("🎯 Sniper Accuracy & News")
+    use_news_guard = st.toggle("Enable Live News Veto Guard", value=True, help="Blocks LONGs if breaking news is Bearish, and blocks SHORTs if news is Bullish.")
+    min_score = st.slider("Min Confidence Score (%)", min_value=65, max_value=95, value=80, step=5)
+    max_signals = st.slider("Max Top Signals per Scan", min_value=1, max_value=5, value=2)
+
+    st.divider()
     st.header("📲 Telegram Alert Bot")
-    tg_token = st.text_input("Bot Token", value=cfg["tg_token"], type="password", placeholder="123456:ABC-DEF...")
-    tg_chat_id = st.text_input("Chat ID", value=cfg["tg_chat_id"], placeholder="e.g. 987654321")
+    tg_token = st.text_input("Bot Token", value=cfg["tg_token"], type="password")
+    tg_chat_id = st.text_input("Chat ID", value=cfg["tg_chat_id"])
     
     c1, c2 = st.columns(2)
     if c1.button("💾 Save Bot", use_container_width=True):
         save_config(tg_token, tg_chat_id)
         st.success("Saved!")
     if c2.button("🔔 Test Alert", use_container_width=True):
-        if send_telegram_msg(tg_token, tg_chat_id, "✅ <b>Crypto Quant V3 Bot Connected!</b>\nYou will now receive instant 24/7 trade alerts."):
+        if send_telegram_msg(tg_token, tg_chat_id, "✅ <b>Crypto Quant V4 (Technical + News Engine) Connected!</b>"):
             st.success("Sent!")
         else:
-            st.error("Failed! Check Token/ID.")
+            st.error("Failed!")
 
     st.divider()
-    st.header("⚙️ Risk & Filter Settings")
+    st.header("⚙️ Risk Calculator")
     acc_balance = st.number_input("Account Balance ($)", min_value=10.0, value=100.0, step=10.0)
     risk_pct = st.slider("Risk per Trade (%)", min_value=0.5, max_value=5.0, value=1.5, step=0.5)
-    max_signals = st.slider("Max Top Signals per Scan", min_value=1, max_value=5, value=3)
-    min_score = st.slider("Minimum Confidence Score (%)", min_value=60, max_value=90, value=70, step=5)
 
     st.divider()
     st.header("🗑️ History Management")
@@ -444,19 +542,22 @@ with st.sidebar:
         st.rerun()
 
 # Main UI Layout
-st.title("⚡ Crypto Futures Confluence Scanner V3")
-st.caption("Auto-Scan Engine • Instant Telegram Bot • Smart Structure Stops")
+st.title("⚡ Crypto Quant Sniper V4 (Technical + Live News)")
+st.caption("Ultra-Strict Multi-Timeframe Confluence • Live NLP News Sentiment Guard • Fear & Greed Index")
 
-tab1, tab2 = st.tabs(["🚀 Active Market Signals", "📊 Historical Track Record"])
+tab1, tab2, tab3 = st.tabs(["🚀 Sniper Signals", "📰 Live Market News & Sentiment", "📊 Historical Track Record"])
 
 with tab1:
-    if st.button("🔄 Scan Top 20 Now", use_container_width=True):
-        execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, tg_chat_id)
+    if st.button("🔄 Run Ultra-Accuracy Scan (Technical + News)", use_container_width=True):
+        execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, tg_chat_id, use_news_guard)
 
-    if 'btc_regime' in st.session_state:
+    if 'btc_regime' in st.session_state and 'news_data' in st.session_state:
         b_reg, b_rsi = st.session_state['btc_regime']
-        reg_color = "#00e676" if b_reg == "STRONG_BULL" else ("#ff5252" if b_reg == "STRONG_BEAR" else "#ffb74d")
-        st.markdown(f"**🌐 BTC Market Regime:** <span style='color:{reg_color}; font-weight:bold;'>{b_reg}</span> (BTC 15m RSI: {b_rsi})", unsafe_allow_html=True)
+        nd = st.session_state['news_data']
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("🌐 BTC Market Regime", b_reg, f"15m RSI: {b_rsi}")
+        mc2.metric("📰 Global News Sentiment", nd['global_bias'], f"NLP Score: {nd['global_score']}")
+        mc3.metric("😨 Fear & Greed Index", f"{nd['fng_val']} ({nd['fng_class']})")
 
     found = st.session_state.get('last_scan', [])
     if found:
@@ -477,7 +578,7 @@ with tab1:
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                     <h3 style="margin:0; color:white;">{s['coin']} — <span style="color:{color};">{s['verdict']}</span> @ ${p_str}</h3>
                     <span style="background-color:#2b2b36; color:#ffd54f; padding:4px 10px; border-radius:6px; font-weight:bold;">
-                        🔥 Confidence: {s['score']}%
+                        🔥 Sniper Score: {s['score']}% | 📰 News: {s['news_label']}
                     </span>
                 </div>
                 <p style="margin:8px 0; color:#e0e0e0; font-size:15px;">
@@ -486,13 +587,29 @@ with tab1:
                 <p style="margin:4px 0; color:#80cbc4; font-size:13.5px;">
                     💰 <b>Risk (${round(risk_amount, 2)}):</b> Position Size: <b>${pos_size_usdt} USDT</b> &nbsp;|&nbsp; Suggested Max Leverage: <b>{rec_lev}x</b>
                 </p>
+                <p style="margin:4px 0; color:#b0bec5; font-size:12.5px;">
+                    🗞️ <i>Latest News: "{s['headline']}"</i>
+                </p>
                 <small style="color:#9e9e9e;">RSI (15m): {s['rsi']} &nbsp;|&nbsp; ADX (15m): {s['adx']} &nbsp;|&nbsp; Volume (RVOL): {s['rvol']}x</small>
             </div>
             """, unsafe_allow_html=True)
     elif st.session_state.get('scan_completed'):
-        st.info("⏸️ No high-probability setups passed all Institutional Filters right now. Capital preservation mode active!")
+        st.info("⏸️ No setups passed the 80%+ Sniper Accuracy & News Guard right now. Waiting for A+ institutional alignment!")
 
 with tab2:
+    st.subheader("📰 Live Crypto News & NLP Sentiment Breakdown")
+    if 'news_data' not in st.session_state:
+        st.session_state['news_data'] = fetch_market_news_and_fng()
+    nd = st.session_state['news_data']
+    st.write("**Top Breaking Crypto Headlines:**")
+    for h in nd.get("top_headlines", []):
+        st.markdown(f"- 🗞️ {h}")
+    if nd.get("coins"):
+        st.write("**Coin-Specific News Sentiment Detected:**")
+        news_rows = [{"Coin": k, "Sentiment Score": v["score"], "Articles": v["count"], "Latest Headline": v["headline"]} for k, v in nd["coins"].items()]
+        st.dataframe(pd.DataFrame(news_rows), use_container_width=True)
+
+with tab3:
     col_a, col_b = st.columns([3, 2])
     with col_a:
         if st.button("🔄 Refresh Outcomes & Win Rate", use_container_width=True):
@@ -512,7 +629,7 @@ with tab2:
 
         df = pd.DataFrame(signals)
         if 'score' not in df.columns:
-            df['score'] = 75
+            df['score'] = 80
         closed = df[df['status'].isin(["FULL WIN (TP2)", "PARTIAL WIN (TP1->BE)", "LOSS (SL Hit)"])]
         wins = len(closed[closed['status'].str.contains("WIN")])
         total_closed = len(closed)
@@ -532,10 +649,9 @@ with tab2:
     else:
         st.write("No recorded signals yet.")
 
-# Background Auto-Scan Loop
 if auto_scan:
     if not st.session_state.get('scan_completed'):
-        execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, tg_chat_id)
+        execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, tg_chat_id, use_news_guard)
         st.rerun()
     placeholder = st.sidebar.empty()
     total_secs = scan_interval * 60
@@ -544,5 +660,5 @@ if auto_scan:
         placeholder.info(f"⏳ Next Auto-Scan in: **{mins:02d}:{secs:02d}**")
         time.sleep(1)
     placeholder.empty()
-    execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, tg_chat_id)
+    execute_full_scan(min_score, max_signals, acc_balance, risk_pct, tg_token, tg_chat_id, use_news_guard)
     st.rerun()
